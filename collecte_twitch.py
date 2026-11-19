@@ -12,7 +12,7 @@ from pathlib import Path
 import requests
 
 # ---------------- PARAMÈTRES ----------------
-MAX_STREAMS_PAR_RELEVE = 2000
+MAX_STREAMS_PAR_RELEVE = 5000
 MIN_SPECTATEURS = 1000
 INTERVALLE_HEURES = 4
 DUREE_JOURS = 7
