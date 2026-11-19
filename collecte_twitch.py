@@ -2,9 +2,8 @@
 
 Une exécution = un relevé. Un seul CSV cumulatif, compatible avec l'ancien CSV.
 Secrets GitHub : TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET.
-Option facultative : TWITCH_USER_TOKEN autorisé avec moderator:read:followers
-pour les chaînes dont le compte est diffuseur ou modérateur. Les followers
-ne sont PAS accessibles globalement avec un app token.
+Le champ total des followers est accessible avec un token d'application.
+La liste des followers, en revanche, nécessite des autorisations utilisateur.
 """
 import csv
 import os
@@ -15,7 +14,7 @@ from pathlib import Path
 
 import requests
 
-MAX_STREAMS_PAR_RELEVE = 5000
+MAX_STREAMS_PAR_RELEVE = 2000
 MIN_SPECTATEURS = 1000
 INTERVALLE_HEURES = 4
 DUREE_JOURS = 7
@@ -161,30 +160,25 @@ def types_de_comptes(api, ids):
     return resultat
 
 
-def followers_autorises(api, ids, user_token):
-    """Tentative facultative avec token utilisateur : jamais de total inventé."""
+def followers_publics(api, ids):
+    """Total public des followers, accessible avec le jeton d'application."""
     resultats = {}
-    if not user_token:
-        print('Followers : aucune autorisation utilisateur fournie, valeurs vides.')
-        return resultats
-    refus = 0
-    for identifiant in ids:
+    for numero, identifiant in enumerate(ids, 1):
         resultat = api.get('/channels/followers',
                            {'broadcaster_id': identifiant, 'first': 1},
-                           user_token=user_token, optional=True)
-        if resultat is None or 'total' not in resultat:
-            refus += 1
-            continue
-        resultats[identifiant] = int(resultat['total'])
-    print(f'Followers disponibles pour {len(resultats)} chaînes ; '
-          f'indisponibles pour {refus}.')
+                           optional=True)
+        if resultat is not None and 'total' in resultat:
+            resultats[identifiant] = int(resultat['total'])
+        if numero % 100 == 0:
+            print(f'Followers : {numero}/{len(ids)} chaînes vérifiées.')
+    print(f'Followers disponibles : {len(resultats)}/{len(ids)}.')
     return resultats
 
 
 def lignes_nouvelles(streams, slot, releve, api):
     ids = list(dict.fromkeys(s['user_id'] for s in streams if s.get('user_id')))
     types = types_de_comptes(api, ids)
-    followers = followers_autorises(api, ids, os.environ.get('TWITCH_USER_TOKEN'))
+    followers = followers_publics(api, ids)
     lignes = []
     for s in streams:
         debut_live = date_utc(s['started_at']) if s.get('started_at') else None
