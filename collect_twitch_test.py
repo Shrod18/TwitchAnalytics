@@ -108,7 +108,30 @@ def recuperer_statuts(session, client_id, jeton, streams):
     return statuts
 
 
-def enregistrer(streams, statuts, date_prevue, date_collecte):
+def recuperer_followers(session, client_id, jeton, streams):
+    """Récupère le total public des followers pour chaque chaîne.
+
+    La liste nominative nécessite des autorisations, pas le champ total.
+    """
+    ids = list(dict.fromkeys(s["user_id"] for s in streams if s.get("user_id")))
+    followers = {}
+    for numero, identifiant in enumerate(ids, 1):
+        try:
+            resultat = appeler(
+                session, client_id, jeton, "/channels/followers",
+                {"broadcaster_id": identifiant, "first": 1},
+            )
+            if "total" in resultat:
+                followers[identifiant] = int(resultat["total"])
+        except requests.RequestException as erreur:
+            print(f"  Followers indisponibles pour {identifiant}: {erreur}", flush=True)
+        if numero % 100 == 0:
+            print(f"  Followers : {numero}/{len(ids)} chaînes vérifiées", flush=True)
+    print(f"  Followers récupérés : {len(followers)}/{len(ids)}", flush=True)
+    return followers
+
+
+def enregistrer(streams, statuts, followers, date_prevue, date_collecte):
     fichier_vide = not SORTIE.exists() or SORTIE.stat().st_size == 0
     with SORTIE.open("a", encoding="utf-8-sig", newline="") as fichier:
         writer = csv.DictWriter(fichier, fieldnames=COLONNES)
@@ -120,6 +143,8 @@ def enregistrer(streams, statuts, date_prevue, date_collecte):
                 duree = max(0, round((date_collecte - debut).total_seconds() / 60, 1))
             except (KeyError, ValueError, TypeError):
                 duree = ""
+            nombre_followers = followers.get(stream.get("user_id"))
+            viewers = int(stream.get("viewer_count") or 0)
             writer.writerow({
                 "scheduled_at": date_prevue.isoformat(),
                 "collected_at": date_collecte.isoformat(),
@@ -133,13 +158,13 @@ def enregistrer(streams, statuts, date_prevue, date_collecte):
                 "language": stream.get("language", ""),
                 "title": stream.get("title", ""),
                 "source": "twitch_helix_test",
-                "follower_count": "",  # Non accessible globalement avec le token d'application
-                "follower_status": "unavailable",
+                "follower_count": nombre_followers if nombre_followers is not None else "",
+                "follower_status": "available" if nombre_followers is not None else "unavailable",
                 "broadcaster_type": statuts.get(stream.get("user_id"), ""),
                 "stream_duration_minutes": duree,
                 "day_of_week": date_collecte.strftime("%A"),
                 "hour_of_day": date_collecte.hour,  # UTC
-                "viewer_follower_ratio": "",
+                "viewer_follower_ratio": round(viewers / nombre_followers, 6) if nombre_followers and nombre_followers > 0 else "",
             })
 
 
@@ -166,8 +191,9 @@ def main():
             try:
                 streams = recuperer_streams(session, client_id, jeton)
                 statuts = recuperer_statuts(session, client_id, jeton, streams)
+                followers = recuperer_followers(session, client_id, jeton, streams)
                 date_collecte = datetime.now(timezone.utc)
-                enregistrer(streams, statuts, date_prevue, date_collecte)
+                enregistrer(streams, statuts, followers, date_prevue, date_collecte)
                 print(f"  -> {len(streams)} streams enregistrés dans {SORTIE.name}", flush=True)
             except requests.HTTPError as exc:
                 if exc.response is not None and exc.response.status_code == 401:
