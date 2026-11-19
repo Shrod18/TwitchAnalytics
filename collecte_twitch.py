@@ -1,9 +1,7 @@
-"""Collecte Twitch Helix sur 7 jours, toutes les 4 h, dans un CSV unique.
-
-Démarrage : python collecte_twitch.py
-Reprise : relancer exactement la même commande dans le même dossier.
-Nécessite : pip install requests
-Variables d'environnement : TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET
+"""Une collecte Twitch Helix par exécution (GitHub Actions, toutes les 4 h).
+La campagne s’arrête après 42 relevés ou après 7 jours UTC depuis le premier.
+Les relevés sont conservés dans un CSV unique, versionné par le workflow.
+Variables d’environnement : TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET.
 """
 import csv
 import os
@@ -14,7 +12,7 @@ from pathlib import Path
 import requests
 
 # ---------------- PARAMÈTRES ----------------
-MAX_STREAMS_PAR_RELEVE = 5000
+MAX_STREAMS_PAR_RELEVE = 2000
 MIN_SPECTATEURS = 1000
 INTERVALLE_HEURES = 4
 DUREE_JOURS = 7
@@ -159,50 +157,36 @@ def main():
     client_id = os.environ.get("TWITCH_CLIENT_ID")
     secret = os.environ.get("TWITCH_CLIENT_SECRET")
     if not client_id or not secret:
-        raise RuntimeError("Renseignez TWITCH_CLIENT_ID et TWITCH_CLIENT_SECRET dans PowerShell.")
-    debut, realises = charger_slots_existants()
-    if debut is None:
-        debut = utc_now().replace(microsecond=0)
-    nb_slots = DUREE_JOURS * 24 // INTERVALLE_HEURES  # 42 collectes (J0 à J6 + 20 h)
-    print(f"CSV unique : {FICHIER_CSV}")
-    print(f"Campagne : {debut.isoformat()} -> {(debut + timedelta(days=DUREE_JOURS)).isoformat()}")
-    print(f"{nb_slots} relevés prévus, jusqu'à {MAX_STREAMS_PAR_RELEVE} streams >= {MIN_SPECTATEURS} viewers par relevé")
+        raise RuntimeError("Secrets TWITCH_CLIENT_ID / TWITCH_CLIENT_SECRET absents.")
+
+    debut, slots = charger_slots_existants()
+    maintenant = utc_now()
+    nb_max = DUREE_JOURS * 24 // INTERVALLE_HEURES  # 42
+
+    if debut is not None:
+        if len(slots) >= nb_max or maintenant >= debut + timedelta(days=DUREE_JOURS):
+            print("Campagne terminée : aucun nouveau relevé.")
+            return
+        # Protège contre plusieurs lancements dans la même fenêtre de 4 heures.
+        if slots:
+            dernier = max(datetime.fromisoformat(slot) for slot in slots)
+            if maintenant < dernier + timedelta(hours=INTERVALLE_HEURES - 0.25):
+                print("Relevé déjà effectué récemment : aucune modification.")
+                return
+
+    # La première exécution fixe le début réel de la campagne.
+    slot = maintenant.replace(microsecond=0)
+    print(f"Collecte UTC : {slot.isoformat()}")
     session = requests.Session()
     try:
         token = obtenir_token(session, client_id, secret)
-        for index in range(nb_slots):
-            slot = debut + timedelta(hours=index * INTERVALLE_HEURES)
-            cle = slot.isoformat()
-            if cle in realises:
-                continue
-            maintenant = utc_now()
-            # Ne jamais fabriquer de relevé pour un créneau manqué (PC éteint, etc.).
-            if maintenant >= slot + timedelta(hours=INTERVALLE_HEURES):
-                print(f"Créneau manqué : {cle} (ignoré)")
-                continue
-            if maintenant < slot:
-                secondes = (slot - maintenant).total_seconds()
-                print(f"Prochain relevé : {slot.isoformat()} (dans {secondes/3600:.2f} h)")
-                while utc_now() < slot:
-                    time.sleep(min(30, max(0.5, (slot - utc_now()).total_seconds())))
-            print(f"\nCollecte {index + 1}/{nb_slots} : {utc_now().isoformat()}")
-            try:
-                streams, token = collecter(session, client_id, secret, token)
-                date_releve = utc_now()
-                if not streams:
-                    print("Aucun stream éligible ; aucune ligne inventée.")
-                    continue
-                enregistrer(streams, slot, date_releve)
-                realises.add(cle)
-                print(f"Enregistré : {len(streams)} streams ; minimum observé : {min(s['viewer_count'] for s in streams)}")
-            except (requests.RequestException, ValueError, RuntimeError) as exc:
-                print(f"Relevé non enregistré : {exc}")
-                print("Vous pouvez relancer le script pour retenter ce créneau s'il n'est pas expiré.")
-                # Ne pas lancer les cycles suivants tant que l'incident n'est pas résolu.
-                break
-        print(f"\nFin de l'exécution. CSV : {FICHIER_CSV}")
-    except KeyboardInterrupt:
-        print(f"\nCollecte interrompue. CSV conservé : {FICHIER_CSV}")
+        streams, _ = collecter(session, client_id, secret, token)
+        if not streams:
+            print("Aucun stream éligible : pas de ligne artificielle.")
+            return
+        enregistrer(streams, slot, utc_now())
+        print(f"Relevé enregistré : {len(streams)} streams >= {MIN_SPECTATEURS} spectateurs.")
+        print(f"CSV cumulatif : {FICHIER_CSV}")
     finally:
         session.close()
 
