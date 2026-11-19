@@ -1,6 +1,0 @@
-API Twitch
-client_id
-iynvpq15aojsn72blcv1csy3922y42
-
-secret_key
-4umafaxihh79xwryi026stncsiuyl2
