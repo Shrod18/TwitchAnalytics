@@ -1,195 +1,271 @@
-"""Une collecte Twitch Helix par exécution (GitHub Actions, toutes les 4 h).
-La campagne s’arrête après 42 relevés ou après 7 jours UTC depuis le premier.
-Les relevés sont conservés dans un CSV unique, versionné par le workflow.
-Variables d’environnement : TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET.
+"""Collecte Twitch Helix enrichie, pour GitHub Actions toutes les 4 heures.
+
+Une exécution = un relevé. Un seul CSV cumulatif, compatible avec l'ancien CSV.
+Secrets GitHub : TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET.
+Option facultative : TWITCH_USER_TOKEN autorisé avec moderator:read:followers
+pour les chaînes dont le compte est diffuseur ou modérateur. Les followers
+ne sont PAS accessibles globalement avec un app token.
 """
 import csv
 import os
+import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
 
-# ---------------- PARAMÈTRES ----------------
 MAX_STREAMS_PAR_RELEVE = 5000
 MIN_SPECTATEURS = 1000
 INTERVALLE_HEURES = 4
 DUREE_JOURS = 7
-FICHIER_CSV = Path(__file__).resolve().parent / "twitch_helix_7jours.csv"
+FICHIER_CSV = Path(__file__).resolve().parent / 'twitch_helix_7jours.csv'
 
-CHAMPS = [
-    "scheduled_at", "collected_at", "stream_id", "user_id", "user_name",
-    "game_id", "game_name", "viewer_count", "started_at", "language",
-    "title", "source",
+ANCIENS_CHAMPS = [
+    'scheduled_at', 'collected_at', 'stream_id', 'user_id', 'user_name',
+    'game_id', 'game_name', 'viewer_count', 'started_at', 'language',
+    'title', 'source',
 ]
+NOUVEAUX_CHAMPS = [
+    'follower_count', 'follower_status', 'broadcaster_type',
+    'stream_duration_minutes', 'day_of_week', 'hour_of_day',
+    'viewer_follower_ratio',
+]
+CHAMPS = ANCIENS_CHAMPS + NOUVEAUX_CHAMPS
+BASE_URL = 'https://api.twitch.tv/helix'
 
 
-def utc_now():
+def maintenant_utc():
     return datetime.now(timezone.utc)
 
 
+def date_utc(texte):
+    return datetime.fromisoformat(str(texte).replace('Z', '+00:00')).astimezone(timezone.utc)
+
+
 def obtenir_token(session, client_id, secret):
-    r = session.post(
-        "https://id.twitch.tv/oauth2/token",
-        data={"client_id": client_id, "client_secret": secret,
-              "grant_type": "client_credentials"},
-        timeout=30,
-    )
-    r.raise_for_status()
-    return r.json()["access_token"]
+    reponse = session.post('https://id.twitch.tv/oauth2/token', data={
+        'client_id': client_id,
+        'client_secret': secret,
+        'grant_type': 'client_credentials',
+    }, timeout=30)
+    reponse.raise_for_status()
+    return reponse.json()['access_token']
 
 
-def charger_slots_existants():
-    """Reprendre depuis le CSV, sans créer de second fichier d'état."""
+class API:
+    def __init__(self, session, client_id, secret):
+        self.session = session
+        self.client_id = client_id
+        self.secret = secret
+        self.token = obtenir_token(session, client_id, secret)
+
+    def get(self, endpoint, params=None, user_token=None, optional=False):
+        """Retry quota/5xx/réseau ; erreurs 401/403 facultatives -> None."""
+        for tentative in range(6):
+            token = user_token if user_token else self.token
+            try:
+                reponse = self.session.get(
+                    BASE_URL + endpoint,
+                    headers={'Client-Id': self.client_id,
+                             'Authorization': f'Bearer {token}'},
+                    params=params, timeout=35,
+                )
+            except requests.RequestException:
+                if tentative == 5:
+                    if optional:
+                        return None
+                    raise
+                time.sleep(min(30, 2 ** (tentative + 1)))
+                continue
+            if reponse.status_code == 401 and not user_token:
+                self.token = obtenir_token(self.session, self.client_id, self.secret)
+                if tentative < 5:
+                    continue
+            if reponse.status_code in (401, 403) and optional:
+                return None
+            if reponse.status_code == 429:
+                reset = float(reponse.headers.get('Ratelimit-Reset', time.time() + 60))
+                time.sleep(max(1, min(600, reset - time.time() + 1)))
+                continue
+            if reponse.status_code >= 500:
+                if tentative == 5:
+                    if optional:
+                        return None
+                    reponse.raise_for_status()
+                time.sleep(min(30, 2 ** (tentative + 1)))
+                continue
+            if optional and not reponse.ok:
+                return None
+            reponse.raise_for_status()
+            return reponse.json()
+        if optional:
+            return None
+        raise RuntimeError('Échec API après plusieurs tentatives')
+
+
+def lire_csv_existant():
     if not FICHIER_CSV.exists() or FICHIER_CSV.stat().st_size == 0:
-        return None, set()
-    with FICHIER_CSV.open("r", encoding="utf-8-sig", newline="") as f:
-        lecteur = csv.DictReader(f)
-        if not lecteur.fieldnames or "scheduled_at" not in lecteur.fieldnames:
-            raise ValueError("Le CSV existe mais n'a pas le format attendu. Sauvegardez-le avant de continuer.")
-        slots = {row["scheduled_at"] for row in lecteur if row.get("scheduled_at")}
+        return [], None, set()
+    with FICHIER_CSV.open('r', encoding='utf-8-sig', newline='') as fichier:
+        lecteur = csv.DictReader(fichier)
+        colonnes = lecteur.fieldnames or []
+        if not set(ANCIENS_CHAMPS).issubset(colonnes):
+            raise ValueError('CSV existant incompatible : sauvegardez-le avant modification.')
+        lignes = list(lecteur)
+    slots = {ligne['scheduled_at'] for ligne in lignes if ligne.get('scheduled_at')}
     if not slots:
-        raise ValueError("CSV existant sans relevé complet : vérifier avant de relancer.")
-    # Le premier slot est le début fixé de la campagne.
-    debut = min(datetime.fromisoformat(s) for s in slots)
-    return debut, slots
+        raise ValueError('CSV existant sans créneau horodaté.')
+    return lignes, min(date_utc(s) for s in slots), slots
 
 
-def appel_streams(session, client_id, secret, token, params):
-    """Retourne (json, token). Retry API 429/5xx et réauthentification 401."""
-    for tentative in range(6):
-        try:
-            r = session.get(
-                "https://api.twitch.tv/helix/streams",
-                headers={"Client-Id": client_id, "Authorization": f"Bearer {token}"},
-                params=params,
-                timeout=35,
-            )
-        except requests.RequestException as exc:
-            if tentative == 5:
-                raise
-            attente = min(60, 2 ** (tentative + 1))
-            print(f"Erreur réseau ({exc}) ; nouvel essai dans {attente}s")
-            time.sleep(attente)
-            continue
-        if r.status_code == 401:
-            token = obtenir_token(session, client_id, secret)
-            continue
-        if r.status_code == 429:
-            reset = float(r.headers.get("Ratelimit-Reset", time.time() + 60))
-            attente = max(1, min(600, reset - time.time() + 1))
-            print(f"Quota API : attente {attente:.0f}s")
-            time.sleep(attente)
-            continue
-        if 500 <= r.status_code < 600:
-            if tentative == 5:
-                r.raise_for_status()
-            attente = min(60, 2 ** (tentative + 1))
-            print(f"Erreur serveur {r.status_code} ; nouvel essai dans {attente}s")
-            time.sleep(attente)
-            continue
-        r.raise_for_status()
-        return r.json(), token
-    raise RuntimeError("Échec des requêtes après plusieurs tentatives")
-
-
-def collecter(session, client_id, secret, token):
+def collecter_streams(api):
     streams = {}
     curseur = None
-    deja_vus = set()
-    # Seuil appliqué localement : Helix ne propose pas de filtre viewer_count minimal.
-    # Les résultats sont triés par audience décroissante.
+    curseurs_vus = set()
     while len(streams) < MAX_STREAMS_PAR_RELEVE:
-        params = {"first": 100}
+        params = {'first': 100}
         if curseur:
-            params["after"] = curseur
-        resultat, token = appel_streams(session, client_id, secret, token, params)
-        page = resultat.get("data", [])
+            params['after'] = curseur
+        resultat = api.get('/streams', params)
+        page = resultat.get('data', [])
         if not page:
             break
-        seuil_franchi = False
-        for s in page:
-            audience = int(s.get("viewer_count") or 0)
+        seuil_atteint = False
+        for stream in page:
+            audience = int(stream.get('viewer_count') or 0)
             if audience < MIN_SPECTATEURS:
-                seuil_franchi = True
+                seuil_atteint = True
                 break
-            streams.setdefault(s["id"], s)
+            streams.setdefault(stream['id'], stream)
             if len(streams) >= MAX_STREAMS_PAR_RELEVE:
                 break
-        if seuil_franchi or len(streams) >= MAX_STREAMS_PAR_RELEVE:
+        if seuil_atteint or len(streams) >= MAX_STREAMS_PAR_RELEVE:
             break
-        nouveau_curseur = resultat.get("pagination", {}).get("cursor")
-        if not nouveau_curseur or nouveau_curseur == curseur or nouveau_curseur in deja_vus:
+        prochain = resultat.get('pagination', {}).get('cursor')
+        if not prochain or prochain == curseur or prochain in curseurs_vus:
             break
-        deja_vus.add(nouveau_curseur)
-        curseur = nouveau_curseur
-    return list(streams.values()), token
+        curseurs_vus.add(prochain)
+        curseur = prochain
+    return list(streams.values())
 
 
-def enregistrer(streams, slot, date_releve):
-    """Append d'un relevé au CSV unique."""
-    nouveau = not FICHIER_CSV.exists() or FICHIER_CSV.stat().st_size == 0
-    with FICHIER_CSV.open("a", encoding="utf-8-sig", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=CHAMPS)
-        if nouveau:
-            w.writeheader()
-        for s in streams:
-            w.writerow({
-                "scheduled_at": slot.isoformat(),
-                "collected_at": date_releve.isoformat(),
-                "stream_id": s["id"],
-                "user_id": s.get("user_id", ""),
-                "user_name": s.get("user_name", ""),
-                "game_id": s.get("game_id", ""),
-                "game_name": s.get("game_name", ""),
-                "viewer_count": int(s["viewer_count"]),
-                "started_at": s.get("started_at", ""),
-                "language": s.get("language", ""),
-                "title": s.get("title", ""),
-                "source": "twitch_helix",
-            })
-        f.flush()
-        os.fsync(f.fileno())
+def types_de_comptes(api, ids):
+    """Get Users accepte jusqu'à 100 identifiants par requête."""
+    resultat = {}
+    for debut in range(0, len(ids), 100):
+        bloc = ids[debut:debut + 100]
+        donnees = api.get('/users', [('id', identifiant) for identifiant in bloc])
+        for user in donnees.get('data', []):
+            resultat[user['id']] = user.get('broadcaster_type', '')
+    return resultat
+
+
+def followers_autorises(api, ids, user_token):
+    """Tentative facultative avec token utilisateur : jamais de total inventé."""
+    resultats = {}
+    if not user_token:
+        print('Followers : aucune autorisation utilisateur fournie, valeurs vides.')
+        return resultats
+    refus = 0
+    for identifiant in ids:
+        resultat = api.get('/channels/followers',
+                           {'broadcaster_id': identifiant, 'first': 1},
+                           user_token=user_token, optional=True)
+        if resultat is None or 'total' not in resultat:
+            refus += 1
+            continue
+        resultats[identifiant] = int(resultat['total'])
+    print(f'Followers disponibles pour {len(resultats)} chaînes ; '
+          f'indisponibles pour {refus}.')
+    return resultats
+
+
+def lignes_nouvelles(streams, slot, releve, api):
+    ids = list(dict.fromkeys(s['user_id'] for s in streams if s.get('user_id')))
+    types = types_de_comptes(api, ids)
+    followers = followers_autorises(api, ids, os.environ.get('TWITCH_USER_TOKEN'))
+    lignes = []
+    for s in streams:
+        debut_live = date_utc(s['started_at']) if s.get('started_at') else None
+        duree = max(0, round((releve - debut_live).total_seconds() / 60, 1)) if debut_live else ''
+        count = followers.get(s.get('user_id'))
+        audience = int(s.get('viewer_count') or 0)
+        lignes.append({
+            'scheduled_at': slot.isoformat(),
+            'collected_at': releve.isoformat(),
+            'stream_id': s['id'],
+            'user_id': s.get('user_id', ''),
+            'user_name': s.get('user_name', ''),
+            'game_id': s.get('game_id', ''),
+            'game_name': s.get('game_name', ''),
+            'viewer_count': audience,
+            'started_at': s.get('started_at', ''),
+            'language': s.get('language', ''),
+            'title': s.get('title', ''),
+            'source': 'twitch_helix',
+            'follower_count': count if count is not None else '',
+            'follower_status': 'available' if count is not None else 'unavailable',
+            'broadcaster_type': types.get(s.get('user_id'), ''),
+            'stream_duration_minutes': duree,
+            'day_of_week': releve.strftime('%A'),
+            'hour_of_day': releve.hour,  # UTC
+            'viewer_follower_ratio': round(audience / count, 6) if count and count > 0 else '',
+        })
+    return lignes
+
+
+def enregistrer_atomiquement(anciennes, nouvelles):
+    """Migration des anciens CSV + nouvelles lignes en une seule écriture atomique."""
+    fd, nom_temporaire = tempfile.mkstemp(prefix='.twitch_', suffix='.csv',
+                                          dir=str(FICHIER_CSV.parent))
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8-sig', newline='') as fichier:
+            writer = csv.DictWriter(fichier, fieldnames=CHAMPS, extrasaction='ignore')
+            writer.writeheader()
+            for ligne in anciennes + nouvelles:
+                writer.writerow(ligne)
+            fichier.flush()
+            os.fsync(fichier.fileno())
+        os.replace(nom_temporaire, FICHIER_CSV)
+    finally:
+        if os.path.exists(nom_temporaire):
+            os.remove(nom_temporaire)
 
 
 def main():
-    client_id = os.environ.get("TWITCH_CLIENT_ID")
-    secret = os.environ.get("TWITCH_CLIENT_SECRET")
+    client_id = os.environ.get('TWITCH_CLIENT_ID')
+    secret = os.environ.get('TWITCH_CLIENT_SECRET')
     if not client_id or not secret:
-        raise RuntimeError("Secrets TWITCH_CLIENT_ID / TWITCH_CLIENT_SECRET absents.")
+        raise RuntimeError('Secrets TWITCH_CLIENT_ID / TWITCH_CLIENT_SECRET absents.')
 
-    debut, slots = charger_slots_existants()
-    maintenant = utc_now()
-    nb_max = DUREE_JOURS * 24 // INTERVALLE_HEURES  # 42
-
+    anciennes, debut, slots = lire_csv_existant()
+    maintenant = maintenant_utc()
+    max_collectes = DUREE_JOURS * 24 // INTERVALLE_HEURES
     if debut is not None:
-        if len(slots) >= nb_max or maintenant >= debut + timedelta(days=DUREE_JOURS):
-            print("Campagne terminée : aucun nouveau relevé.")
+        if len(slots) >= max_collectes or maintenant >= debut + timedelta(days=DUREE_JOURS):
+            print('Campagne déjà terminée : aucun nouveau relevé.')
             return
-        # Protège contre plusieurs lancements dans la même fenêtre de 4 heures.
-        if slots:
-            dernier = max(datetime.fromisoformat(slot) for slot in slots)
-            if maintenant < dernier + timedelta(hours=INTERVALLE_HEURES - 0.25):
-                print("Relevé déjà effectué récemment : aucune modification.")
-                return
+        dernier = max(date_utc(slot) for slot in slots)
+        if maintenant < dernier + timedelta(hours=INTERVALLE_HEURES - 0.25):
+            print('Collecte récente déjà enregistrée : rien à faire.')
+            return
 
-    # La première exécution fixe le début réel de la campagne.
     slot = maintenant.replace(microsecond=0)
-    print(f"Collecte UTC : {slot.isoformat()}")
-    session = requests.Session()
-    try:
-        token = obtenir_token(session, client_id, secret)
-        streams, _ = collecter(session, client_id, secret, token)
+    with requests.Session() as session:
+        api = API(session, client_id, secret)
+        streams = collecter_streams(api)
         if not streams:
-            print("Aucun stream éligible : pas de ligne artificielle.")
+            print('Aucun stream ayant au moins 1000 spectateurs.')
             return
-        enregistrer(streams, slot, utc_now())
-        print(f"Relevé enregistré : {len(streams)} streams >= {MIN_SPECTATEURS} spectateurs.")
-        print(f"CSV cumulatif : {FICHIER_CSV}")
-    finally:
-        session.close()
+        releve = maintenant_utc()
+        nouvelles = lignes_nouvelles(streams, slot, releve, api)
+        enregistrer_atomiquement(anciennes, nouvelles)
+        print(f'{len(nouvelles)} observations ajoutées au CSV {FICHIER_CSV.name}')
+        print(f'Statut de chaîne disponible pour {sum(bool(x["broadcaster_type"]) for x in nouvelles)} streams.')
+        print(f'Followers disponibles pour {sum(x["follower_status"] == "available" for x in nouvelles)} streams.')
+        print(f'Total CSV : {len(anciennes) + len(nouvelles)} lignes.')
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
